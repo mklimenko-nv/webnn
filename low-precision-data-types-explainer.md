@@ -8,12 +8,11 @@ This explainer summarizes the importance of low-precision floating point data ty
   - [Motivation](#motivation)
   - [Proposed data types overview and use cases](#proposed-data-types-overview-and-use-cases)
     - [1.	`bfloat16`](#1bfloat16)
-    - [2.	`float8`](#2float8)
+    - [2.	`float8e4m3`](#2float8e4m3)
   - [Proposed changes](#proposed-changes)
     - [1.	Extend MLOperandDataType](#1extend-mloperanddatatype)
-    - [2.	New scale descriptor for quantization](#2new-scale-descriptor-for-quantization)
-    - [3.	Extend per-operator type tables](#3extend-per-operator-type-tables)
-    - [4.	Extend buffer validation mechanism](#4extend-buffer-validation-mechanism)
+    - [2.	Extend per-operator type tables](#2extend-per-operator-type-tables)
+    - [3.	Extend buffer validation mechanism](#3extend-buffer-validation-mechanism)
   - [Data types and Q/DQ nodes handling](#data-types-and-qdq-nodes-handling)
   - [Accuracy implications](#accuracy-implications)
   - [Pros and cons](#pros-and-cons)
@@ -23,7 +22,7 @@ This explainer summarizes the importance of low-precision floating point data ty
 
 
 ## Motivation
-The latest developments in both specialized hardware, as well as AI and large language models (LLMs) have radically shifted the bottlenecks of machine learning. Specifically in inference, such models are rarely compute-bound nowadays, they're limited by memory bandwidth and capacity. Loading and storing billions of parameters in 32-bit (`float8`) or even 16-bit (`float16`) floating-point formats results in a massive memory footprint and overwhelms the memory bandwidth, causing high latency and power consumption.
+The latest developments in both specialized hardware, as well as AI and large language models (LLMs) have radically shifted the bottlenecks of machine learning. Specifically in inference, such models are rarely compute-bound nowadays, they're limited by memory bandwidth and capacity. Loading and storing billions of parameters in 32-bit (`float32`) or even 16-bit (`float16`) floating-point formats results in a massive memory footprint and overwhelms the memory bandwidth, causing high latency and power consumption.
 
 Hardware vendors in cooperation with software researchers proved, that in most cases model weights and activations can leverage lower-precision data types with negligible accuracy impact. This led to development of native silicon support in GPUs and NPUs for such data types, allowing to both save memory footprint by compressing the weights and activations, as well as increase the compute throughput.
 
@@ -38,12 +37,12 @@ However, this format has been getting more traction lately in multiple applicati
 2.	In case of LLMs running with long contexts, KV-cache tensors and attention intermediates can span a wide dynamic range across layers and sequence length. `float16` range increases the risk of clipping and accumulated drift over long prefills and generation, degrading the output quality and causing inconsistencies.
 3.	When using Mixture-of-Experts (MoE) models, different experts have sparse and uneven activation scales, sometimes varying by orders of magnitude. Extended range of `bfloat16` allows for more robust expert routing.
 
-### 2.	`float8`
+### 2.	`float8e4m3`
 Float8 is a family of 8-bit floating point formats standardized under the OFP8 and Microscaling Formats (MX) Specification, extending the idea of using lower-precision data types and designed to roughly double the compute throughput relative to 16-bit floating point data types. Unlike 16-bit floating point data types, `float8` have a limited range and rely on scaling to stay numerically stable. Depending on the model, this scaling can be performed on a per-tensor, per-channel or per-block level.
 
 OCP specification lists two main formats of `float8`, rearranging the bit allocation between the exponent and mantissa, named E5M2 (typical for gradients in training) and E4M3 (typical for weights and activations in inference), with one bit reserved for the sign. Those data types are primarily used in LLMs to speed up matrix multiplications and compress KV-cache but are also quite useful for diffusion and classical computer vision models, providing a hardware-friendly alternative to integer quantization, with competitive accuracy when properly scaled.
 
-Despite easier upcast to `float16`, E5M2 subformat is primarily used in training and provides limited benefits for inference. In this explainer we'll focus on E4M3 format only.
+Despite easier upcast to `float16`, E5M2 subformat is primarily used in training and provides limited benefits for inference. In this explainer we'll focus on E4M3 format only, hence the explicit `float8e4m3` naming rather than a bare `float8`. This targets the OCP/IEEE-style E4M3 encoding with standard infinity and NaN representations. Vendor-specific saturating variants without infinities (e.g. `float8_e4m3fnuz`) are considered out of scope to avoid fragmenting the API surface.
 
 ## Proposed changes
 We propose extending the MLOperandDataType enum and define, how these types interact with typed arrays, since JavaScript lacks native `bfloat16` and `float8` arrays.
@@ -61,32 +60,16 @@ enum MLOperandDataType {
   "uint8",
   // Proposed additions:
   "bfloat16",
-  "float8"	// Synonymous to float8e4m3 in this scenario
+  "float8e4m3"
 };
 ```
-To address the lack of those data types in JavaScript, developers will pass those weights as `Uint16Array` for `bfloat16`, and `Uint8Array` for `float8`.
+To address the lack of those data types in JavaScript, developers will pass those weights as `Uint16Array` for `bfloat16`, and `Uint8Array` for `float8e4m3`.
 
-### 2.	New scale descriptor for quantization
-Current Q/DQ approach is designed with affine integer semantics in mind. The following changes extend it to address block-wise and microscaling formats.
-
-```javascript
-enum MLQuantizationScheme {
-  "affine",           // scale * (x – zp) // existing
-  "symmetric-float",  // x * scale, zp = 0
-  "blockwise-float"  // per-block scaling tensor
-};
-
-dictionary MLQuantizationOptions : MLOperatorOptions {
-  MLQuantizationScheme scheme = "affine";
-  unsigned long blockSize;
-};
-```
-
-### 3.	Extend per-operator type tables
+### 2.	Extend per-operator type tables
 Every operator specification provides a tensor limits table with allowed data types for different operands. With an introduction of additional low-precision floating-point data types those tables need to be reviewed and extended.
 
-### 4.	Extend buffer validation mechanism
-Currently, buffer validation is only done for strongly typed buffers. In case of low-precision floating-point data types, this check is significantly simplified and would always return True for `ArrayBufferView` due to usage of `Uint8Array`. The algorithm should consider that the low-precision data types are represented using non-native JavaScript data types, but the dimensions and the element count still needs to be validated.
+### 3.	Extend buffer validation mechanism
+Currently, buffer validation checks that the `ArrayBufferView`'s type matches the operand's data type exactly. There is already precedent for relaxing this: before `Float16Array` existed, `float16` operands accepted a `Uint16Array` as the underlying storage. Following the same pattern, `bfloat16` and `float8e4m3` operands would accept `Uint16Array` and `Uint8Array` respectively as type-punned storage. The validation algorithm needs to be updated to allow this substitution while still validating that the buffer's element count and byte length match the operand's shape and per-element size.
 
 ## Data types and Q/DQ nodes handling
 Due to a significant variety of hardware available to users, spanning across multiple generations, it is expected that some data types could be unsupported. WebNN delegates the graph execution to the underlying framework (like DirectML, CoreML, Windows ML).
@@ -153,7 +136,7 @@ The end goal is to execute the provided model when the hardware natively support
 ## Accuracy implications
 It is evident, that reducing precision from 32-bit to 8-bit or even 4-bit introduces quantization noise. Thankfully, floating-point data types degrade a lot more gracefully than their integer counterparts (`int8` and `int4`).
 1.	`bfloat16` — often near-lossless accuracy loss for most models, in most cases can be used as a stand-in replacement for `float16`.
-2.	`float8` — in most cases requires a calibration dataset for post-training quantization. In most cases, outliers are handled better than in `int8` due to 4-bit exponent in E4M3 flavor.
+2.	`float8e4m3` — usually requires a calibration dataset for post-training quantization. In most cases, outliers are handled better than in `int8` due to its 4-bit exponent.
 
 ## Pros and cons
 ### Pros
@@ -163,7 +146,7 @@ It is evident, that reducing precision from 32-bit to 8-bit or even 4-bit introd
 4.	Storing the weights in low-precision data types results in smaller model size, resulting in reducing the download time and memory footprint.
 
 ### Cons
-1.	Introduces additional API complexity into `quantizeLinear` and `dequantizeLinear` ops to take block sizes and scales into account.
+1.	Extends the accepted data types for `quantizeLinear` and `dequantizeLinear` operands to include `bfloat16` and `float8e4m3`, growing the per-operator type-table surface.
 2.	Packing and unpacking low-precision floating point types using placeholder data storage containers like `Uint8Array` places an ergonomic burden on the web developer and reduces the amount of available type checks.
 3.	Additional pressure is put on the WebNN backends to implement robust software fallbacks when hardware support is absent.
 
